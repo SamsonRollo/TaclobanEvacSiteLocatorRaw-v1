@@ -1,0 +1,290 @@
+<!--Generated and copiloted by ChatGPT 5-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Tacloban Evacuation Centers — Find Nearby</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Leaflet -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIuVX1C9GqkHuxZiZ1t6B2zD1VZbZL0utXI="
+    crossorigin=""
+  />
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+
+  <!-- Leaflet Control Geocoder (Nominatim) -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.css"
+  />
+  <script src="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.js"></script>
+
+  <!-- PapaParse for CSV -->
+  <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <!-- Turf.js for nearest + distance -->
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #app { display: grid; grid-template-rows: auto 1fr; height: 100%; }
+    header {
+      padding: 10px 12px;
+      background: #0e7490; color: #fff;
+      display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    }
+    header h1 { font-size: 16px; margin: 0 10px 0 0; }
+    header button, header input {
+      padding: 8px 10px; border: 0; border-radius: 8px;
+    }
+    header button { background: #064e3b; color: #fff; cursor: pointer; }
+    header button:hover { background: #065f46; }
+    #map { width: 100%; height: 100%; }
+    #panel {
+      position: absolute;
+      top: 70px; right: 10px; z-index: 1000;
+      width: 320px; max-width: calc(100% - 20px);
+      background: #ffffffcc; backdrop-filter: blur(4px);
+      border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.15);
+      overflow: hidden;
+    }
+    #panel header {
+      background: #0e7490; color: #fff; padding: 10px 12px;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    #panel header h2 { font-size: 14px; margin: 0; }
+    #results { max-height: 50vh; overflow: auto; padding: 8px 12px; }
+    .result {
+      border-bottom: 1px solid #e5e7eb; padding: 8px 0;
+    }
+    .result h3 { font-size: 14px; margin: 0 0 3px; }
+    .result p { margin: 0; font-size: 12px; color: #374151; }
+    .muted { color: #6b7280; }
+    .link { color: #0369a1; text-decoration: none; }
+    .link:hover { text-decoration: underline; }
+    .pill {
+      display: inline-block; padding: 4px 8px; border-radius: 9999px;
+      background: #e0f2fe; color: #0369a1; font-size: 11px; margin-left: 6px;
+    }
+    @media (max-width: 640px) {
+      #panel { top: auto; bottom: 10px; right: 10px; left: 10px; width: auto; }
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>Evacuation Centers — Tacloban</h1>
+    <button id="locateBtn" title="Use my location">📍 Use my location</button>
+    <button id="nearestBtn" title="Find nearest centers">🧭 Find nearest</button>
+    <input id="keyword" type="text" placeholder="Filter by name or Brgy…" />
+    <button id="filterBtn">Filter</button>
+    <small class="muted">Data source: Official list</small>
+  </header>
+  <div id="map"></div>
+</div>
+
+<div id="panel" style="display:none;">
+  <header>
+    <h2>Nearest Centers</h2>
+    <button id="closePanel">✕</button>
+  </header>
+  <div id="results"></div>
+</div>
+
+<script>
+(async function () {
+  // --- Map init ---
+  const tacloban = [11.2433, 125.0020]; // Approx center
+  const map = L.map('map', { zoomControl: true }).setView(tacloban, 13);
+
+  // Basemap (Carto light)
+  L.tileLayer('https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors & Carto'
+  }).addTo(map);
+
+  // --- Load CSV ---
+  // Keep this path if you placed the CSV at /data/tacloban_evac_centers_final.csv
+  const CSV_URL = 'data/tacloban_evac_centers_final.csv';
+
+  function normName(s) {
+    return (s || '')
+      .toLowerCase()
+      .replace(/\bbarangay\b/g, 'brgy')
+      .replace(/\bbrgy\.\b/g, 'brgy')
+      .replace(/\bbrgy\b/g, 'brgy')
+      .replace(/sto\. niño|sto\. nino|sto niño/g, 'sto nino')
+      .replace(/[’'`]/g, '')
+      .replace(/[-–—]/g, ' ')
+      .replace(/[()]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  const csv = await fetch(CSV_URL).then(r => {
+    if (!r.ok) throw new Error('CSV not found at ' + CSV_URL);
+    return r.text();
+  });
+
+  const parsed = Papa.parse(csv, { header: true, skipEmptyLines: true });
+  const rows = parsed.data.map(r => ({
+    Name: r.Name,
+    Location: r.Location,
+    Latitude: r.Latitude ? Number(r.Latitude) : null,
+    Longitude: r.Longitude ? Number(r.Longitude) : null
+  }));
+
+  // --- Convert to GeoJSON FeatureCollection (only with coords for mapping) ---
+  const features = rows
+    .filter(r => typeof r.Latitude === 'number' && typeof r.Longitude === 'number' && !isNaN(r.Latitude) && !isNaN(r.Longitude))
+    .map(r => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [r.Longitude, r.Latitude] },
+      properties: { name: r.Name, location: r.Location }
+    }));
+
+  const fc = { type: 'FeatureCollection', features };
+
+  // --- Layer + markers ---
+  const markerLayer = L.geoJSON(fc, {
+    pointToLayer: (feature, latlng) => {
+      return L.marker(latlng, {
+        title: feature.properties.name
+      });
+    },
+    onEachFeature: (feature, layer) => {
+      const { name, location } = feature.properties;
+      const [lon, lat] = feature.geometry.coordinates;
+      const gmaps = `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(lat + ',' + lon)}&destination_place_id=&travelmode=walking`;
+      layer.bindPopup(
+        `<b>${name}</b><br/>${location}<br/>
+         <a class="link" href="${gmaps}" target="_blank" rel="noopener">Directions</a>`
+      );
+    }
+  }).addTo(map);
+
+  // Fit bounds if we have data
+  if (markerLayer.getLayers().length > 0) {
+    map.fitBounds(markerLayer.getBounds(), { padding: [20, 20] });
+  }
+
+  // --- Geocoder control (address search) ---
+  const geocoder = L.Control.geocoder({
+    defaultMarkGeocode: false
+  }).on('markgeocode', function(e) {
+    const center = e.geocode.center;
+    map.setView(center, 15);
+    if (userMarker) {
+      userMarker.setLatLng(center);
+    } else {
+      userMarker = L.marker(center, { icon: userIcon }).addTo(map);
+    }
+  }).addTo(map);
+
+  // --- User location ---
+  const userIcon = L.divIcon({
+    className: "user-loc",
+    html: '<div style="width:14px;height:14px;background:#2563eb;border:2px solid #fff;border-radius:50%;box-shadow:0 0 0 2px rgba(37,99,235,0.35)"></div>',
+    iconSize: [14,14],
+    iconAnchor: [7,7]
+  });
+  let userMarker = null;
+
+  document.getElementById('locateBtn').addEventListener('click', () => {
+    if (!navigator.geolocation) {
+      alert('Geolocation is not supported by your browser.');
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const ll = [pos.coords.latitude, pos.coords.longitude];
+        if (userMarker) userMarker.setLatLng(ll); else userMarker = L.marker(ll, { icon: userIcon }).addTo(map);
+        map.setView(ll, 15);
+      },
+      (err) => alert('Could not get your location: ' + err.message),
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+  });
+
+  // --- Find nearest centers (top 3) ---
+  const resultsPanel = document.getElementById('panel');
+  const resultsList = document.getElementById('results');
+  const closePanel = document.getElementById('closePanel');
+  closePanel.addEventListener('click', () => resultsPanel.style.display = 'none');
+
+  function showNearestFrom(latlng) {
+    if (!features.length) return;
+
+    const from = turf.point([latlng[1], latlng[0]]); // turf expects [lon, lat]
+    // Build a collection for nearest computations
+    const coll = turf.featureCollection(features);
+
+    // Compute distance for each
+    const withDist = features.map(ft => {
+      const d = turf.distance(from, ft, { units: 'kilometers' });
+      return { feature: ft, distKm: d };
+    }).sort((a, b) => a.distKm - b.distKm);
+
+    const topN = withDist.slice(0, 3);
+    resultsList.innerHTML = '';
+    topN.forEach(({ feature, distKm }, idx) => {
+      const { name, location } = feature.properties;
+      const [lon, lat] = feature.geometry.coordinates;
+      const gmaps = `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(lat + ',' + lon)}&travelmode=walking`;
+      const item = document.createElement('div');
+      item.className = 'result';
+      item.innerHTML = `
+        <h3>${idx+1}. ${name} <span class="pill">${distKm.toFixed(2)} km</span></h3>
+        <p>${location}</p>
+        <p><a class="link" href="${gmaps}" target="_blank" rel="noopener">Open directions</a></p>
+      `;
+      resultsList.appendChild(item);
+    });
+    resultsPanel.style.display = 'block';
+  }
+
+  document.getElementById('nearestBtn').addEventListener('click', () => {
+    if (userMarker) {
+      showNearestFrom(userMarker.getLatLng());
+    } else {
+      // Prompt geolocation once
+      document.getElementById('locateBtn').click();
+      // Wait a moment for permission + position
+      const wait = setInterval(() => {
+        if (userMarker) {
+          clearInterval(wait);
+          showNearestFrom(userMarker.getLatLng());
+        }
+      }, 500);
+      setTimeout(() => clearInterval(wait), 8000);
+    }
+  });
+
+  // --- Keyword filter (by name or barangay text) ---
+  const kw = document.getElementById('keyword');
+  document.getElementById('filterBtn').addEventListener('click', () => {
+    const needle = normName(kw.value || '');
+    markerLayer.eachLayer(layer => {
+      const p = layer.feature.properties;
+      const hay = normName(`${p.name} ${p.location}`);
+      const show = !needle || hay.includes(needle);
+      if (show) { layer.addTo(map); } else { map.removeLayer(layer); }
+    });
+  });
+
+  // Optional: If you prefer to load GeoJSON instead of CSV, host a file like
+  // /data/tacloban_evac_centers_matched.geojson and fetch it, then skip PapaParse.
+  // Replace the CSV block with:
+  // const gj = await fetch('data/tacloban_evac_centers_matched.geojson').then(r=>r.json());
+  // ... then use gj.features as `features`.
+
+})();
+</script>
+</body>
+</html>
