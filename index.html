@@ -100,78 +100,90 @@
 
 <script>
 (async function () {
-  // --- Map init ---
-  const tacloban = [11.2433, 125.0020]; // Approx center
+  const tacloban = [11.2433, 125.0020];
   const map = L.map('map', { zoomControl: true }).setView(tacloban, 13);
 
-  // Basemap (Carto light)
   L.tileLayer('https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png', {
     attribution: '&copy; OpenStreetMap contributors & Carto'
   }).addTo(map);
 
-  // --- Load CSV ---
-  // Keep this path if you placed the CSV at /data/tacloban_evac_centers_final.csv
   const CSV_URL = 'data/tacloban_evac_centers_final.csv';
 
-  function normName(s) {
-    return (s || '')
-      .toLowerCase()
-      .replace(/\bbarangay\b/g, 'brgy')
-      .replace(/\bbrgy\.\b/g, 'brgy')
-      .replace(/\bbrgy\b/g, 'brgy')
-      .replace(/sto\. niño|sto\. nino|sto niño/g, 'sto nino')
-      .replace(/[’'`]/g, '')
-      .replace(/[-–—]/g, ' ')
-      .replace(/[()]/g, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
+  // ---- Helpers ----
+  const LAT_MIN = 10, LAT_MAX = 12, LON_MIN = 124, LON_MAX = 126; // Tacloban sanity box
 
-  const csv = await fetch(CSV_URL).then(r => {
-    if (!r.ok) throw new Error('CSV not found at ' + CSV_URL);
-    return r.text();
+  function norm(str) {
+    return String(str ?? '').trim();
+  }
+  function toNum(x) {
+    const n = parseFloat(norm(x));
+    return Number.isFinite(n) ? n : null;
+  }
+  function inTaclobanBox(lat, lon) {
+    return lat >= LAT_MIN && lat <= LAT_MAX && lon >= LON_MIN && lon <= LON_MAX;
+  }
+  function looksLikeLon(x) { return x && (x < -90 || x > 90); }  // crude but useful
+
+  // ---- Load CSV ----
+  const csvText = await fetch(CSV_URL).then(r => r.text());
+  const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true });
+
+  // Tolerate header variants/spaces/casing
+  const headers = parsed.meta.fields.map(h => h.trim().toLowerCase());
+  const nameKey = headers.find(h => h.includes('name')) || 'name';
+  const locKey  = headers.find(h => h.includes('location')) || 'location';
+  const latKey  = headers.find(h => h.startsWith('lat')) || 'latitude';
+  const lonKey  = headers.find(h => h.startsWith('lon') || h.startsWith('lng')) || 'longitude';
+
+  // ---- Build clean rows ----
+  const cleanRows = parsed.data.map(r => {
+    const name = norm(r[nameKey] ?? r.Name);
+    const location = norm(r[locKey] ?? r.Location);
+
+    let lat = toNum(r[latKey] ?? r.Latitude);
+    let lon = toNum(r[lonKey] ?? r.Longitude);
+
+    // If columns were swapped, fix them
+    if (lat !== null && lon !== null) {
+      if (looksLikeLon(lat) && !looksLikeLon(lon)) {
+        const tmp = lat; lat = lon; lon = tmp;
+      }
+    }
+
+    // Filter out nonsense
+    if (lat === null || lon === null || !inTaclobanBox(lat, lon)) {
+      return { name, location, lat: null, lon: null };
+    }
+    return { name, location, lat, lon };
   });
 
-  const parsed = Papa.parse(csv, { header: true, skipEmptyLines: true });
-  const rows = parsed.data.map(r => ({
-    Name: r.Name,
-    Location: r.Location,
-    Latitude: r.Latitude ? Number(r.Latitude) : null,
-    Longitude: r.Longitude ? Number(r.Longitude) : null
-  }));
-
-  // --- Convert to GeoJSON FeatureCollection (only with coords for mapping) ---
-  const features = rows
-    .filter(r => typeof r.Latitude === 'number' && typeof r.Longitude === 'number' && !isNaN(r.Latitude) && !isNaN(r.Longitude))
+  // ---- Build GeoJSON only for valid coords ----
+  const features = cleanRows
+    .filter(r => r.lat !== null && r.lon !== null)
     .map(r => ({
       type: 'Feature',
-      geometry: { type: 'Point', coordinates: [r.Longitude, r.Latitude] },
-      properties: { name: r.Name, location: r.Location }
+      geometry: { type: 'Point', coordinates: [r.lon, r.lat] },
+      properties: { name: r.name, location: r.location }
     }));
 
   const fc = { type: 'FeatureCollection', features };
 
-  // --- Layer + markers ---
+  // ---- Add markers ----
   const markerLayer = L.geoJSON(fc, {
-    pointToLayer: (feature, latlng) => {
-      return L.marker(latlng, {
-        title: feature.properties.name
-      });
-    },
+    pointToLayer: (feature, latlng) => L.marker(latlng, { title: feature.properties.name }),
     onEachFeature: (feature, layer) => {
       const { name, location } = feature.properties;
       const [lon, lat] = feature.geometry.coordinates;
-      const gmaps = `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(lat + ',' + lon)}&destination_place_id=&travelmode=walking`;
-      layer.bindPopup(
-        `<b>${name}</b><br/>${location}<br/>
-         <a class="link" href="${gmaps}" target="_blank" rel="noopener">Directions</a>`
-      );
+      const gmaps = `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(lat + ',' + lon)}&travelmode=walking`;
+      layer.bindPopup(`<b>${name}</b><br/>${location}<br/>
+        <a class="link" href="${gmaps}" target="_blank" rel="noopener">Directions</a>`);
     }
   }).addTo(map);
 
-  // Fit bounds if we have data
   if (markerLayer.getLayers().length > 0) {
-    map.fitBounds(markerLayer.getBounds(), { padding: [20, 20] });
+    map.fitBounds(markerLayer.getBounds(), { padding: [20,20], maxZoom: 16 });
+  } else {
+    map.setView(tacloban, 13);
   }
 
   // --- Geocoder control (address search) ---
